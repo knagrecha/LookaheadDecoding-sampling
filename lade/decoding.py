@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList, GreedySearchOutput
 from transformers.generation.logits_process import TemperatureLogitsWarper
+import torch.distributed as dist
 import os, time
 FUNC_MAP = {}
 CONFIG_MAP = {}
@@ -211,12 +212,17 @@ def jacobi_greedy_search_multilevel(
     unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
     this_peer_finished = False  # used by synced_gpus only
-
+    ############### configurations 
     WINDOW_SIZE = CONFIG_MAP.get("WINDOW_SIZE", 60)
     GUESS_SET_SIZE = CONFIG_MAP.get("GUESS_SET_SIZE", 60)
     ALWAYS_FWD_ONE = CONFIG_MAP.get("ALWAYS_FWD_ONE", 1)
     LEVEL = CONFIG_MAP.get("LEVEL", 8)
     DEBUG = CONFIG_MAP.get("DEBUG", 0)
+    DIST_WORKERS = CONFIG_MAP.get("DIST_WORKERS", 1)
+    LOCAL_RANK = CONFIG_MAP.get("LOCAL_RANK", 0)
+    USE_FLASH = CONFIG_MAP.get("USE_FLASH", 0) #not use flash by default
+    USE_AWQ = False #not support AWQ
+    #IN FLASH ATTENTION WE REORDERED LOOKAHEAD WINDOW 
 
     GUESS_SIZE = LEVEL - 1
     NOT_SEQ = 0
@@ -263,16 +269,6 @@ def jacobi_greedy_search_multilevel(
                                    spaces_between_special_tokens=False, clean_up_tokenization_spaces=True,)
         prev = len(init)
     
-    USE_AWQ = False 
-    try:
-        from awq.modules.fused.cache import WindowedCache
-        window_cache = []
-        for param in self.modules():
-            if hasattr(param, "cache") and type(param.cache) is WindowedCache:
-                USE_AWQ = True
-                window_cache.append(param.cache)
-    except:
-        pass 
 
     #print("first input: ", init, flush=True)
     while True:
@@ -353,7 +349,7 @@ def jacobi_greedy_search_multilevel(
 
 
         new_results = []
-        #print("fill levle: ", fill_level)
+        #print("fill level: ", fill_level)
         if past_tokens[1] is None:
             assert fill_level == 0
             past_tokens[0] = past_tokens[0][1:] 
@@ -457,40 +453,19 @@ def jacobi_greedy_search_multilevel(
             attention_mask = model_kwargs["attention_mask"]
             model_kwargs["attention_mask"] = torch.cat((attention_mask, torch.ones(1, max_hit, device=attention_mask.device, dtype=attention_mask.dtype)), dim=1)
         
-        #support awq
-
-        if not USE_AWQ:
-            past_key_values = []
-            for idx, kv in enumerate(outputs.past_key_values):
-                for hh in range(max_hit):
-                    assert outputs.step_len == kv[0].size(2)
-                    kv[0][:,:,outputs.kvcache_len + hh,:] = kv[0][:,:,outputs.step_len-len(guess_tokens)+hit_point * GUESS_SIZE + hh,:]
-                    kv[1][:,:,outputs.kvcache_len + hh,:] = kv[1][:,:,outputs.step_len-len(guess_tokens)+hit_point * GUESS_SIZE + hh,:]
-                past_key_values.append( (kv[0][:,:,:outputs.kvcache_len + max_hit,:], kv[1][:,:,:outputs.kvcache_len + max_hit,:]) )
-            outputs.past_key_values = past_key_values
-
-        else:
-            
+        #not support awq
+        #print("kv: ", outputs.past_key_values)
+        assert not USE_AWQ
+        past_key_values = []
+        for idx, kv in enumerate(outputs.past_key_values):
             for hh in range(max_hit):
-                #print("cache: ", outputs.kvcache_len, max_hit, outputs.step_len, window_cache[0].k.size(), window_cache[0].v.size())
-                for idx, kv in enumerate(window_cache):            
-                    kv.k[:,:,:,outputs.kvcache_len + hh,:] = kv.k[:,:,:,outputs.step_len-len(guess_tokens)+hit_point * GUESS_SIZE + hh,:]
-                    kv.v[:,:,outputs.kvcache_len + hh,:] = kv.v[:,:,outputs.step_len-len(guess_tokens)+hit_point * GUESS_SIZE + hh,:]
-        
-
-            past_key_values = []
-            for idx, kv in enumerate(outputs.past_key_values):
-                for hh in range(max_hit):
-                    assert outputs.step_len == kv[0].size(2)
-                past_key_values.append( (kv[0][:,:,:outputs.kvcache_len + max_hit,:], kv[1][:,:,:outputs.kvcache_len + max_hit,:]) )
-            outputs.past_key_values = past_key_values
-
+                assert outputs.step_len == kv[0].size(2)
+                kv[0][:,:,outputs.kvcache_len + hh,:] = kv[0][:,:,outputs.step_len-len(guess_tokens)+hit_point * GUESS_SIZE + hh,:]
+                kv[1][:,:,outputs.kvcache_len + hh,:] = kv[1][:,:,outputs.step_len-len(guess_tokens)+hit_point * GUESS_SIZE + hh,:]
+            past_key_values.append( (kv[0][:,:,:outputs.kvcache_len + max_hit,:], kv[1][:,:,:outputs.kvcache_len + max_hit,:]) )
+        outputs.past_key_values = past_key_values
 
         lst_token = hits[max_hit]
-        def sublist(lst1, lst2):
-            ls1 = [element for element in lst1 if element in lst2]
-            ls2 = [element for element in lst2 if element in lst1]
-            return ls1 == ls2
 
         for hh in range(max_hit + 1):
             if eos_token_id is not None and hits[hh] == eos_token_id[0]:
@@ -501,9 +476,6 @@ def jacobi_greedy_search_multilevel(
                 max_hit = hh
                 break
             else:
-                # 
-                #
-                #
                 all_old_tokens.append(hits[hh])
         
         if chat:
@@ -558,12 +530,13 @@ def jacobi_greedy_search_multilevel(
         all_old_tokens = all_old_tokens[:init_len + max_length]
         input_ids = input_ids[:][:init_len + max_length]
 
-    if DEBUG:
+    if DEBUG and LOCAL_RANK == 0:
         #print("===DEBUG INFO===", " generated tokens: ", len(all_old_tokens) - init_len, "total step: ", steps, len(token_map.keys()), sum(len(value) for value in token_map.values()), input_ids.numel(), reps)
 
         print("\n==========================ACCELERATION===SUMMARY======================================")
         print("Generated tokens: ", len(all_old_tokens) - init_len, "Total steps: ", steps, " Compression ratio: ", round((len(all_old_tokens) - init_len) / steps, 2))
         print("======================================================================================", end="")
+        CONFIG_MAP["log"].append([len(all_old_tokens) - init_len, steps, round((len(all_old_tokens) - init_len) / steps, 2)])
     
 
     if streamer is not None:
